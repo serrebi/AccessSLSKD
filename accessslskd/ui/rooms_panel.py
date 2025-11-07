@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import threading
-from typing import List
+from typing import List, Optional, Tuple
 
 import wx
 from ..slsk_client import SlskService
@@ -12,6 +12,7 @@ class RoomsPanel(wx.Panel):
         super().__init__(parent)
         self.service = service
         self.on_status = on_status
+        self._avail_timer: Optional[wx.Timer] = None
         self._build_ui()
 
     def _build_ui(self):
@@ -30,6 +31,14 @@ class RoomsPanel(wx.Panel):
         jrow.Add(self.btnLeave, 0, wx.RIGHT, 6)
         jrow.Add(self.btnRefresh, 0)
         tops.Add(jrow, 0, wx.EXPAND | wx.ALL, 8)
+
+        # Available list
+        tops.Add(wx.StaticText(self, label="Available Rooms (double-click to join):"), 0, wx.LEFT, 8)
+        self.lstAvailable = wx.ListCtrl(self, style=wx.LC_REPORT | wx.BORDER_SUNKEN)
+        self.lstAvailable.InsertColumn(0, "Room", width=420)
+        self.lstAvailable.InsertColumn(1, "Users", width=70, format=wx.LIST_FORMAT_RIGHT)
+        self.lstAvailable.InsertColumn(2, "Private", width=70)
+        tops.Add(self.lstAvailable, 1, wx.EXPAND | wx.LEFT | wx.RIGHT | wx.BOTTOM, 8)
 
         # Joined list
         tops.Add(wx.StaticText(self, label="Joined Rooms:"), 0, wx.LEFT, 8)
@@ -59,10 +68,24 @@ class RoomsPanel(wx.Panel):
         self.Bind(wx.EVT_LISTBOX, self._on_select_room, self.lstRooms)
         self.Bind(wx.EVT_BUTTON, self._on_send, self.btnSend)
         self.Bind(wx.EVT_TEXT_ENTER, self._on_send, self.txtMsg)
+        self.Bind(wx.EVT_LIST_ITEM_ACTIVATED, self._on_join_from_available, self.lstAvailable)
 
     def _with_status(self, msg: str):
         if callable(self.on_status):
             self.on_status(msg)
+
+    # Activation from MainFrame (starts auto-refresh of the available list)
+    def on_activated(self, active: bool):
+        if active:
+            if not self._avail_timer:
+                self._avail_timer = wx.Timer(self)
+                self.Bind(wx.EVT_TIMER, self._on_timer_available, self._avail_timer)
+            # Kick off immediate load, then every 60s
+            self._load_available()
+            self._avail_timer.Start(60000)
+        else:
+            if self._avail_timer:
+                self._avail_timer.Stop()
 
     def _on_join(self, evt):
         name = self.txtRoom.GetValue().strip()
@@ -103,6 +126,49 @@ class RoomsPanel(wx.Panel):
                 wx.CallAfter(self._with_status, f"Refresh failed: {e}")
                 wx.Bell()
         threading.Thread(target=worker, daemon=True).start()
+
+    def _on_timer_available(self, evt):
+        self._load_available()
+
+    def _load_available(self):
+        def worker():
+            try:
+                infos = self.service.rooms_available() or []
+                # Convert into tuples (name, userCount, private)
+                rows: List[Tuple[str, int, bool]] = []
+                for r in infos:
+                    try:
+                        rows.append((str(r.get("name","")), int(r.get("userCount", 0)), bool(r.get("isPrivate", False))))
+                    except Exception:
+                        pass
+                # Sort by user count desc, then name
+                rows.sort(key=lambda x: (-x[1], x[0].lower()))
+                wx.CallAfter(self._fill_available, rows)
+            except Exception as e:
+                wx.CallAfter(self._with_status, f"Load rooms failed: {e}")
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _fill_available(self, rows: List[Tuple[str, int, bool]]):
+        self.lstAvailable.Freeze()
+        try:
+            self.lstAvailable.DeleteAllItems()
+            for (name, count, priv) in rows:
+                idx = self.lstAvailable.InsertItem(self.lstAvailable.GetItemCount(), name)
+                self.lstAvailable.SetItem(idx, 1, str(count))
+                self.lstAvailable.SetItem(idx, 2, "Yes" if priv else "No")
+        finally:
+            self.lstAvailable.Thaw()
+        self._with_status(f"{len(rows)} rooms available.")
+
+    def _on_join_from_available(self, evt):
+        idx = evt.GetIndex()
+        if idx < 0:
+            return
+        name = self.lstAvailable.GetItemText(idx) or ""
+        if not name:
+            return
+        self.txtRoom.SetValue(name)
+        self._on_join(None)
 
     def _fill_rooms(self, names: List[str]):
         self.lstRooms.Set(names or [])
@@ -158,4 +224,3 @@ class RoomsPanel(wx.Panel):
                 wx.CallAfter(self._with_status, f"Send failed: {e}")
                 wx.Bell()
         threading.Thread(target=worker, daemon=True).start()
-

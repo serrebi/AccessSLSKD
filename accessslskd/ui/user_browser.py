@@ -60,16 +60,18 @@ class UserBrowserFrame(wx.Frame):
         self._miDownloadDir = self._menu.Append(wx.ID_ANY, "Download &Directory")
         self.list.Bind(wx.EVT_LIST_ITEM_RIGHT_CLICK, lambda e: self.PopupMenu(self._menu))
         self.Bind(wx.EVT_MENU, lambda e: self._on_download_selected(e), self._miDownload)
-        self.Bind(wx.EVT_MENU, lambda e: self._on_download_dir(e), self._miDownloadDir)
+        self.Bind(wx.EVT_MENU, lambda e: self._on_download_dir2(e), self._miDownloadDir)
 
         # Events
         self.Bind(wx.EVT_BUTTON, self._on_open, self.btnGo)
         self.Bind(wx.EVT_TEXT_ENTER, self._on_open, self.txtPath)
         self.Bind(wx.EVT_BUTTON, self._on_up, self.btnUp)
         self.Bind(wx.EVT_BUTTON, self._on_download_selected, self.btnDownloadSelected)
-        self.Bind(wx.EVT_BUTTON, self._on_download_dir, self.btnDownloadDir)
+        self.Bind(wx.EVT_BUTTON, self._on_download_dir2, self.btnDownloadDir)
         self.tree.Bind(wx.EVT_TREE_ITEM_EXPANDING, self._on_expand)
         self.tree.Bind(wx.EVT_TREE_SEL_CHANGED, self._on_tree_select)
+        # Also support Enter/double-click on directories in the right list
+        self.list.Bind(wx.EVT_LIST_ITEM_ACTIVATED, self._on_list_activated)
 
     def _status(self, msg: str):
         if callable(self.on_status):
@@ -86,6 +88,64 @@ class UserBrowserFrame(wx.Frame):
                 wx.Bell()
         threading.Thread(target=worker, daemon=True).start()
 
+    def _on_download_dir2(self, evt):
+        # Prefer selected directories; else use the current path.
+        dirs = []
+        i = -1
+        current_dir = self.txtPath.GetValue().strip()
+        while True:
+            i = self.list.GetNextItem(i, wx.LIST_NEXT_ALL, wx.LIST_STATE_SELECTED)
+            if i == -1:
+                break
+            kind = (self.list.GetItemText(i, 2) or "").lower()
+            if kind == "dir":
+                name = self.list.GetItemText(i, 0) or ""
+                if name:
+                    sep = "\\" if "\\" in current_dir else "/"
+                    full = name if not current_dir else (current_dir.rstrip("\\/") + sep + name)
+                    dirs.append(full)
+        if not dirs and current_dir:
+            dirs = [current_dir]
+        if not dirs:
+            self._status("Select a directory (or open one) first.")
+            return
+        many = len(dirs) > 1
+        self._status(f"Enqueueing {len(dirs)} director{'ies' if many else 'y'}...")
+        def worker2():
+            try:
+                total = 0
+                failed = 0
+                for d in dirs:
+                    n = self.service.enqueue_directory(self.username, d)
+                    if n <= 0:
+                        failed += 1
+                    total += max(0, n)
+                msg = f"Enqueued {total} file(s) from {len(dirs)} director{'ies' if many else 'y'}."
+                if failed:
+                    msg += f" ({failed} failed)"
+                wx.CallAfter(self._status, msg)
+            except Exception as e:
+                wx.CallAfter(self._status, f"Directory enqueue failed: {e}")
+                wx.Bell()
+        threading.Thread(target=worker2, daemon=True).start()
+
+    def _on_list_activated(self, evt):
+        # If the activated row is a directory, open it.
+        try:
+            idx = evt.GetIndex()
+        except Exception:
+            idx = -1
+        if idx is None or idx < 0:
+            return
+        kind = (self.list.GetItemText(idx, 2) or "").lower()
+        name = self.list.GetItemText(idx, 0) or ""
+        if kind == "dir" and name:
+            base = self.txtPath.GetValue().strip()
+            sep = "\\" if ("\\" in base) else "/"
+            newp = name if (not base) else (base.rstrip("\\/") + sep + name)
+            self.txtPath.SetValue(newp)
+            self._open_path(newp)
+
     def _after_root(self, root):
         self.tree.DeleteAllItems()
         root_id = self.tree.AddRoot(self.username)
@@ -98,9 +158,18 @@ class UserBrowserFrame(wx.Frame):
             self.tree.SetItemData(child, ("dir", d.get("name", "")))
             self.tree.SetItemHasChildren(child, True)
         self.tree.Expand(root_id)
+        # Populate list with top-level folders for screen reader navigation
         self.list.DeleteAllItems()
+        for d in (root.get("directories") or []):
+            idx = self.list.InsertItem(self.list.GetItemCount(), d.get("name", ""))
+            self.list.SetItem(idx, 1, "")
+            self.list.SetItem(idx, 2, "Dir")
+        for d in (root.get("lockedDirectories") or []):
+            idx = self.list.InsertItem(self.list.GetItemCount(), d.get("name", ""))
+            self.list.SetItem(idx, 1, "")
+            self.list.SetItem(idx, 2, "Dir")
         self.txtPath.SetValue("")
-        self._status("Loaded root.")
+        self._status(f"Loaded root. {self.list.GetItemCount()} folders.")
 
     def _on_expand(self, evt):
         item = evt.GetItem()

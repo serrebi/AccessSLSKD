@@ -95,6 +95,8 @@ class MainFrame(wx.Frame):
         s = wx.BoxSizer(wx.VERTICAL)
         s.Add(nb, 1, wx.EXPAND)
         self.SetSizer(s)
+        # Auto-load available rooms when Rooms tab is shown
+        self.Bind(wx.EVT_NOTEBOOK_PAGE_CHANGED, self._on_nb_changed, nb)
 
     # Status helpers
     def _set_status(self, msg: str, right: str = ""):
@@ -145,7 +147,21 @@ class MainFrame(wx.Frame):
         self._connect_with_feedback()
 
     def _on_close(self, evt):
+        try:
+            # Stop rooms auto-refresh timer if running
+            if hasattr(self, "rooms_panel") and hasattr(self.rooms_panel, "on_activated"):
+                self.rooms_panel.on_activated(False)
+        except Exception:
+            pass
         self.Destroy()
+    def _on_nb_changed(self, evt):
+        try:
+            new_idx = evt.GetSelection()
+            page = self.nb.GetPage(new_idx)
+            self.rooms_panel.on_activated(page is self.rooms_panel)
+        except Exception:
+            pass
+        evt.Skip()
 
     # Options handlers
     def _on_toggle_search_auto(self, evt):

@@ -36,6 +36,10 @@ class SearchPanel(wx.Panel):
         # Perf / concurrency guards
         self._fetch_in_progress = False
         self._prev_keys: List[tuple] = []
+        self._auto_cleared_sid: Optional[str] = None
+        self._user_filter_lock_sid: Optional[str] = None
+        self._empty_filtered_ticks: int = 0
+        self._last_type_change_at: float = time.perf_counter()
         self._building_ui()
         self._build_context_menu()
         # Auto update timer for search results
@@ -96,7 +100,7 @@ class SearchPanel(wx.Panel):
         self.Bind(wx.EVT_BUTTON, self._on_enqueue_all, self.btnEnqueueAll)
         self.Bind(wx.EVT_LIST_ITEM_RIGHT_CLICK, self._on_right_click, self.lstFiles)
         self.Bind(wx.EVT_CONTEXT_MENU, self._on_context_menu)
-        self.Bind(wx.EVT_CHOICE, lambda e: self._with_status(f"Type: {self.choiceType.GetStringSelection()}"), self.choiceType)
+        self.Bind(wx.EVT_CHOICE, self._on_type_changed, self.choiceType)
 
     # Helpers
     def _with_status(self, msg: str):
@@ -107,6 +111,13 @@ class SearchPanel(wx.Panel):
                 pass
         if callable(self.on_status):
             self.on_status(msg)
+
+    def _on_type_changed(self, evt):
+        # Record that the user explicitly changed the filter for the current search.
+        self._last_type_change_at = time.perf_counter()
+        self._user_filter_lock_sid = self.current_search_id
+        self._empty_filtered_ticks = 0
+        self._with_status(f"Type: {self.choiceType.GetStringSelection()}")
 
     def _clear_list(self):
         self.lstFiles.DeleteAllItems()
@@ -204,7 +215,7 @@ class SearchPanel(wx.Panel):
                 return True
         return False
 
-    def _flatten_responses(self, responses: List[SearchResponseItem]) -> List[Dict[str, Any]]:
+    def _flatten_responses(self, responses: List[SearchResponseItem], ignore_type: bool = False) -> List[Dict[str, Any]]:
         flat: List[Dict[str, Any]] = []
         for r in responses or []:
             user = r.get("username", "")
@@ -216,7 +227,7 @@ class SearchPanel(wx.Panel):
             # Mark locked files so the UI can display it
             locked = [dict(f, **{"isLocked": True}) if isinstance(f, dict) else f for f in locked]
             for f in (regular + locked):
-                if self._matches_type(str((f or {}).get("filename", "") or "")):
+                if ignore_type or self._matches_type(str((f or {}).get("filename", "") or "")):
                     flat.append(dict(
                         username=user,
                         queueLength=queue,
@@ -339,6 +350,10 @@ class SearchPanel(wx.Panel):
     def _after_new_search_started(self, search_id: str):
         # Clear old results and start polling immediately; keep polling indefinitely
         self._clear_list()
+        self._auto_cleared_sid = None
+        self._user_filter_lock_sid = None
+        self._empty_filtered_ticks = 0
+        self._last_type_change_at = time.perf_counter()
         self._fetch_once()
         self.btnSearch.Enable(True)
         self.btnRefresh.Enable(True)
@@ -524,7 +539,7 @@ class SearchPanel(wx.Panel):
                         responses = []
                 t_resp = (time.perf_counter() - t1) * 1000.0
                 t2 = time.perf_counter()
-                flat = self._flatten_responses(responses)
+                flat = self._flatten_responses(responses, ignore_type=False)
                 t_flat = (time.perf_counter() - t2) * 1000.0
                 wx.CallAfter(self._after_fetch_once, flat, state, dict(ms_state=t_state, ms_resp=t_resp, ms_flat=t_flat, fallback=int(fallback_used)))
             except Exception as e:
@@ -537,6 +552,11 @@ class SearchPanel(wx.Panel):
         self._fetch_in_progress = False
 
     def _after_fetch_once(self, flat_rows: List[Dict[str, Any]], state: SearchState, timings: Dict[str, float] | None = None):
+        # Respect the user's selected Type filter. Do not auto-change it.
+        try:
+            server_count = int(state.get("responseCount", 0)) if isinstance(state, dict) else 0
+        except Exception:
+            server_count = 0
         # Skip repaint if nothing changed (reduces CPU on big result sets)
         new_keys = [self._row_key(r) for r in flat_rows]
         repaint = new_keys != self._prev_keys
@@ -552,7 +572,7 @@ class SearchPanel(wx.Panel):
         ms_resp = (timings or {}).get("ms_resp", 0.0)
         ms_flat = (timings or {}).get("ms_flat", 0.0)
         used_fb = bool((timings or {}).get("fallback")) if timings is not None else False
-        right = f"{len(flat_rows)} files | net:{ms_state+ms_resp:.0f}ms ui:{ms_flat:.0f}ms" + (" +fb" if used_fb else "")
+        right = f"{len(flat_rows)} files | net:{ms_state+ms_resp:.0f}ms ui:{ms_flat:.0f}ms srv:{server_count}" + (" +fb" if used_fb else "")
         self._with_status(f"{'Updated' if repaint else 'No change'} - {len(flat_rows)} files. {right}")
         # Restore selection/scroll
         self._restore_selection(sel_keys, top_key, focus_key)
