@@ -110,8 +110,9 @@ class SlskService:
     def start_search(self, query: str, *, timeout_ms: Optional[int] = None) -> SearchResult:
         self._ensure()
         kwargs: Dict[str, int] = {}
-        # Enforce a minimum of 30 minutes to avoid premature timeouts.
+        # Enforce a minimum of 30 minutes to avoid premature timeouts (works well with slskd).
         MIN_MS = 30 * 60 * 1000  # 1,800,000 ms
+        MAX_MS = None
         try:
             # Prefer explicit override; else config; else default minimum.
             candidate = None
@@ -138,6 +139,20 @@ class SlskService:
     def get_search_responses(self, search_id: str) -> List[SearchResponseItem]:
         self._ensure()
         return self._client.searches.search_responses(search_id)
+
+    def stop_search(self, search_id: str) -> bool:
+        self._ensure()
+        try:
+            return bool(self._client.searches.stop(search_id))
+        except Exception:
+            return False
+
+    def delete_search(self, search_id: str) -> bool:
+        self._ensure()
+        try:
+            return bool(self._client.searches.delete(search_id))
+        except Exception:
+            return False
 
     # Transfers
     def enqueue_downloads(self, username: str, files: List[Dict[str, Any]]) -> bool:

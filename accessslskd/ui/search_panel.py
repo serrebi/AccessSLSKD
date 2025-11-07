@@ -3,6 +3,7 @@ from __future__ import annotations
 import threading
 import time
 from typing import List, Dict, Any, Optional, Set
+import os
 
 import wx
 from slskd_api.apis._types import SearchResponseItem, SearchState
@@ -19,11 +20,17 @@ class SearchPanel(wx.Panel):
         self._flat_rows: List[Dict[str, Any]] = []
         self._auto_enabled = bool(auto_update)
         self._interval_sec = max(1, int(interval_sec))
-        # Enforce a minimum 30-minute timeout for server-side searches
+        # Debug logging toggle via env
+        try:
+            self._debug = str(os.environ.get("ACCESS_SLSKD_DEBUG", "")).strip().lower() in ("1", "true", "yes", "on")
+        except Exception:
+            self._debug = False
+        # Enforce a sensible minimum timeout for server-side searches (align with slskd defaults ~15s)
         try:
             self._search_timeout_ms = int(search_timeout_ms or 0)
         except Exception:
             self._search_timeout_ms = 0
+        # Enforce a minimum 30-minute timeout for server-side searches
         if self._search_timeout_ms <= 0 or self._search_timeout_ms < 30 * 60 * 1000:
             self._search_timeout_ms = 30 * 60 * 1000
         # Perf / concurrency guards
@@ -82,8 +89,8 @@ class SearchPanel(wx.Panel):
         self.SetSizer(tops)
 
         # Events
-        self.Bind(wx.EVT_BUTTON, self._on_search, self.btnSearch)
-        self.Bind(wx.EVT_TEXT_ENTER, self._on_search, self.txtQuery)
+        self.Bind(wx.EVT_BUTTON, self._on_search2, self.btnSearch)
+        self.Bind(wx.EVT_TEXT_ENTER, self._on_search2, self.txtQuery)
         self.Bind(wx.EVT_BUTTON, self._on_refresh, self.btnRefresh)
         self.Bind(wx.EVT_BUTTON, self._on_enqueue_selected, self.btnEnqueueSel)
         self.Bind(wx.EVT_BUTTON, self._on_enqueue_all, self.btnEnqueueAll)
@@ -93,12 +100,22 @@ class SearchPanel(wx.Panel):
 
     # Helpers
     def _with_status(self, msg: str):
+        if getattr(self, "_debug", False):
+            try:
+                print(f"[SearchPanel] {msg}")
+            except Exception:
+                pass
         if callable(self.on_status):
             self.on_status(msg)
 
     def _clear_list(self):
         self.lstFiles.DeleteAllItems()
         self._flat_rows = []
+        # Also reset previous-key cache so a new search repaints even if it yields
+        # the same result keys as a prior search. Without this, starting a second
+        # search that returns identical keys could skip repainting, leaving the
+        # (now-cleared) list visually empty and appearing to hang.
+        self._prev_keys = []
 
     def _selected_type_exts(self) -> Optional[Set[str]]:
         kind = (self.choiceType.GetStringSelection() or "All").lower()
@@ -251,6 +268,54 @@ class SearchPanel(wx.Panel):
         self._flat_rows = flat_rows
 
     # Event handlers
+    def _on_search2(self, evt):
+        query = self.txtQuery.GetValue().strip()
+        if not query:
+            self._with_status("Enter a search query.")
+            return
+        self.btnSearch.Disable()
+        self.btnRefresh.Disable()
+        sel_type = self.choiceType.GetStringSelection() or "All"
+        self._with_status(f"Searching ({sel_type}).")
+        # Stop timer to avoid overlapping fetches while switching searches.
+        prev_id = self.current_search_id
+        try:
+            self._timer.Stop()
+        except Exception:
+            pass
+        self.current_search_id = None
+
+        def worker():
+            try:
+                # If a previous search exists, stop it and briefly wait for it to finalize
+                # to avoid server-side concurrency issues when searches overlap.
+                if prev_id:
+                    try:
+                        self.service.stop_search(prev_id)
+                    except Exception:
+                        pass
+                    waited = 0.0
+                    for _ in range(10):  # up to ~2s
+                        try:
+                            st = self.service.get_search_state(prev_id, include_responses=False)
+                            done = bool(st.get("isComplete")) or str(st.get("state","")).lower() in ("cancelled","completed","stopped","finished")
+                            if done:
+                                break
+                        except Exception:
+                            # If the previous search id is gone, proceed
+                            break
+                        time.sleep(0.2)
+                        waited += 0.2
+                    if waited >= 0.6:
+                        wx.CallAfter(self._with_status, f"Starting new search (waited {waited:.1f}s for previous to finish).")
+                res = self.service.start_search(query, timeout_ms=getattr(self, "_search_timeout_ms", 0) or None)
+                self.current_search_id = res.id
+                wx.CallAfter(self._after_new_search_started, res.id)
+            except Exception as e:
+                wx.CallAfter(self._after_error, f"Search failed: {e}")
+
+        threading.Thread(target=worker, daemon=True).start()
+
     def _on_search(self, evt):
         query = self.txtQuery.GetValue().strip()
         if not query:
@@ -443,12 +508,25 @@ class SearchPanel(wx.Panel):
                 t_state = (time.perf_counter() - t0) * 1000.0
                 # Fetch responses via dedicated endpoint
                 t1 = time.perf_counter()
-                responses = self.service.get_search_responses(sid) or []
+                responses = []
+                fallback_used = False
+                try:
+                    responses = self.service.get_search_responses(sid) or []
+                except Exception:
+                    # Fallback path: some slskd versions may error while finalizing;
+                    # try fetching state with embedded responses.
+                    try:
+                        st_full = self.service.get_search_state(sid, include_responses=True) or {}
+                        responses = list(st_full.get("responses") or [])
+                        state = st_full or state
+                        fallback_used = True
+                    except Exception:
+                        responses = []
                 t_resp = (time.perf_counter() - t1) * 1000.0
                 t2 = time.perf_counter()
                 flat = self._flatten_responses(responses)
                 t_flat = (time.perf_counter() - t2) * 1000.0
-                wx.CallAfter(self._after_fetch_once, flat, state, dict(ms_state=t_state, ms_resp=t_resp, ms_flat=t_flat))
+                wx.CallAfter(self._after_fetch_once, flat, state, dict(ms_state=t_state, ms_resp=t_resp, ms_flat=t_flat, fallback=int(fallback_used)))
             except Exception as e:
                 wx.CallAfter(self._after_error, f"Update failed: {e}")
             finally:
@@ -473,8 +551,9 @@ class SearchPanel(wx.Panel):
         ms_state = (timings or {}).get("ms_state", 0.0)
         ms_resp = (timings or {}).get("ms_resp", 0.0)
         ms_flat = (timings or {}).get("ms_flat", 0.0)
-        right = f"{len(flat_rows)} files | net:{ms_state+ms_resp:.0f}ms ui:{ms_flat:.0f}ms"
-        self._with_status(f"{'Updated' if repaint else 'No change'} — {len(flat_rows)} files. {right}")
+        used_fb = bool((timings or {}).get("fallback")) if timings is not None else False
+        right = f"{len(flat_rows)} files | net:{ms_state+ms_resp:.0f}ms ui:{ms_flat:.0f}ms" + (" +fb" if used_fb else "")
+        self._with_status(f"{'Updated' if repaint else 'No change'} - {len(flat_rows)} files. {right}")
         # Restore selection/scroll
         self._restore_selection(sel_keys, top_key, focus_key)
         # Keep polling indefinitely while Auto Update is enabled.
