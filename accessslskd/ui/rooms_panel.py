@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import threading
-from typing import List, Optional, Tuple
+from typing import List, Optional, Tuple, Dict
 
 import wx
 from ..slsk_client import SlskService
@@ -13,6 +13,9 @@ class RoomsPanel(wx.Panel):
         self.service = service
         self.on_status = on_status
         self._avail_timer: Optional[wx.Timer] = None
+        self._msg_timer: Optional[wx.Timer] = None
+        self._msgs_in_progress = False
+        self._last_msg_count: Dict[str, int] = {}
         self._build_ui()
 
     def _build_ui(self):
@@ -41,9 +44,17 @@ class RoomsPanel(wx.Panel):
         tops.Add(self.lstAvailable, 1, wx.EXPAND | wx.LEFT | wx.RIGHT | wx.BOTTOM, 8)
 
         # Joined list
-        tops.Add(wx.StaticText(self, label="Joined Rooms:"), 0, wx.LEFT, 8)
+        hdr = wx.BoxSizer(wx.HORIZONTAL)
+        self.lblJoinedHeader = wx.StaticText(self, label="Joined Rooms:")
+        self.lblJoinedSummary = wx.StaticText(self, label="")
+        hdr.Add(self.lblJoinedHeader, 0, wx.RIGHT, 8)
+        hdr.Add(self.lblJoinedSummary, 0, wx.ALIGN_CENTER_VERTICAL)
+        tops.Add(hdr, 0, wx.LEFT, 8)
         self.lstRooms = wx.ListBox(self)
         tops.Add(self.lstRooms, 0, wx.EXPAND | wx.LEFT | wx.RIGHT | wx.BOTTOM, 8)
+        # Selected room status
+        self.lblSelectedStatus = wx.StaticText(self, label="")
+        tops.Add(self.lblSelectedStatus, 0, wx.LEFT | wx.BOTTOM, 8)
 
         # Messages + send
         tops.Add(wx.StaticText(self, label="Messages:"), 0, wx.LEFT, 8)
@@ -80,12 +91,20 @@ class RoomsPanel(wx.Panel):
             if not self._avail_timer:
                 self._avail_timer = wx.Timer(self)
                 self.Bind(wx.EVT_TIMER, self._on_timer_available, self._avail_timer)
+            if not self._msg_timer:
+                self._msg_timer = wx.Timer(self)
+                self.Bind(wx.EVT_TIMER, self._on_timer_messages, self._msg_timer)
             # Kick off immediate load, then every 60s
             self._load_available()
+            self._on_refresh(None)
             self._avail_timer.Start(60000)
+            # Auto-refresh messages for selected room every 3s
+            self._msg_timer.Start(3000)
         else:
             if self._avail_timer:
                 self._avail_timer.Stop()
+            if self._msg_timer:
+                self._msg_timer.Stop()
 
     def _on_join(self, evt):
         name = self.txtRoom.GetValue().strip()
@@ -130,6 +149,27 @@ class RoomsPanel(wx.Panel):
     def _on_timer_available(self, evt):
         self._load_available()
 
+    def _on_timer_messages(self, evt):
+        # Poll messages for the currently selected room
+        if self._msgs_in_progress:
+            return
+        room = self._current_room()
+        if not room:
+            return
+        self._msgs_in_progress = True
+        def worker():
+            try:
+                msgs = self.service.rooms_messages(room)
+                wx.CallAfter(self._display_messages, room, msgs)
+            except Exception as e:
+                wx.CallAfter(self._with_status, f"Load messages failed: {e}")
+            finally:
+                wx.CallAfter(self._mark_msgs_idle)
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _mark_msgs_idle(self):
+        self._msgs_in_progress = False
+
     def _load_available(self):
         def worker():
             try:
@@ -172,10 +212,15 @@ class RoomsPanel(wx.Panel):
 
     def _fill_rooms(self, names: List[str]):
         self.lstRooms.Set(names or [])
-        self._with_status(f"{len(names or [])} rooms joined.")
+        count = len(names or [])
+        self.lblJoinedSummary.SetLabel(f"({count} joined)")
+        self._with_status(f"{count} rooms joined.")
         if names:
             self.lstRooms.SetSelection(0)
             self._load_messages(names[0])
+            self._update_selected_status()
+        else:
+            self.lblSelectedStatus.SetLabel("Not joined.")
 
     def _current_room(self) -> str | None:
         sel = self.lstRooms.GetSelection()
@@ -187,6 +232,7 @@ class RoomsPanel(wx.Panel):
         name = self._current_room()
         if name:
             self._load_messages(name)
+            self._update_selected_status()
 
     def _load_messages(self, room: str):
         self._with_status(f"Loading messages for {room}...")
@@ -200,10 +246,16 @@ class RoomsPanel(wx.Panel):
         threading.Thread(target=worker, daemon=True).start()
 
     def _display_messages(self, room: str, msgs):
-        self.txtMessages.Clear()
-        for m in msgs or []:
-            self.txtMessages.AppendText(f"[{m.get('timestamp','')}] {m.get('username','')}: {m.get('message','')}\n")
-        self._with_status(f"{len(msgs or [])} messages in {room}.")
+        prev = int(self._last_msg_count.get(room, 0))
+        cur = len(msgs or [])
+        if cur != prev:
+            # Re-render for simplicity; NVDA will read the update once.
+            self.txtMessages.Clear()
+            for m in msgs or []:
+                self.txtMessages.AppendText(f"[{m.get('timestamp','')}] {m.get('username','')}: {m.get('message','')}\n")
+            self._last_msg_count[room] = cur
+            self._with_status(f"{cur} messages in {room}.")
+        self._update_selected_status()
 
     def _on_send(self, evt):
         room = self._current_room()
@@ -224,3 +276,13 @@ class RoomsPanel(wx.Panel):
                 wx.CallAfter(self._with_status, f"Send failed: {e}")
                 wx.Bell()
         threading.Thread(target=worker, daemon=True).start()
+
+    def _update_selected_status(self):
+        room = self._current_room()
+        if not room:
+            self.lblSelectedStatus.SetLabel("Selected: (none)")
+            return
+        # Assume rooms_joined() reflects truth; label to 'Joined' if present in list
+        names = [self.lstRooms.GetString(i) for i in range(self.lstRooms.GetCount())]
+        joined = room in names
+        self.lblSelectedStatus.SetLabel(f"Selected: {room} — {'Joined' if joined else 'Not joined'}")
